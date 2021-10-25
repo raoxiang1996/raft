@@ -57,15 +57,13 @@ var (
 // other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-
-	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
+	CommandValid  bool
+	CommandIndex  int
+	Command       interface{}
+	SnapshotValid bool   // ignore for lab2; only used in lab3
+	Snapshot      []byte // ignore for lab2; only used in lab3
 	SnapshotIndex int
+	SnapshotTerm  int
 }
 
 //
@@ -102,6 +100,8 @@ type Raft struct {
 	// follower election timeout timestamp
 	electionTimeout  time.Time
 	heartbeatTimeout time.Time
+
+	applyCh chan ApplyMsg
 }
 
 type LogEntry struct {
@@ -286,9 +286,26 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != Leader {
+		return index, term, isLeader
+	}
+
+	nlog := LogEntry{command, rf.currentTerm, rf.logs[len(rf.logs)-1].Index + 1}
+	isLeader = (rf.state == Leader)
+	rf.logs = append(rf.logs, nlog) // 提交一个命令其实就是向日志里面添加一项 在心跳包的时候同步
+
+	//fmt.Printf("leader append log [leader=%d], [term=%d], [command=%v]\n",
+	//rf.me, rf.currentTerm, command)
+
+	index = len(rf.logs)
+	term = rf.currentTerm
+
+	//rf.persist() // 2C
 
 	return index, term, isLeader
 }
@@ -593,29 +610,19 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 	reply.Success = false
 	if args.Term < rf.currentTerm {
 		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.setNewTerm(args.Term)
-		rf.votedFor = -1
-	}
-	rf.currentTerm = args.Term
-	rf.state = Follower
-	reply.Term = rf.currentTerm
-	if args.PrevLogIndex < 0 {
-		reply.Term, reply.Success = 0, false
-		return
-	}
-	rf.resetElectionTimeout()
-	if len(args.Entries) == 0 { //心跳包
-		if rf.lastApplied < args.LeaderCommit { //TODO len(rf.logs)-1 改为 rf.lastApplied+1
-			rf.commitIndex = args.LeaderCommit
-			//go rf.commitLogs() // 可能提交的日志落后与leader 同步一下日志
-		}
-		reply.CommitIndex = len(rf.logs) - 1
-		reply.Success = true
-		rf.votedFor = -1
-		log.Infof("[AppendEntries] Heartbeat: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
 	} else {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		if args.Term > rf.currentTerm {
+			rf.setNewTerm(args.Term)
+		}
+		reply.Term = rf.currentTerm
+		if args.PrevLogIndex < 0 {
+			reply.Term, reply.Success = -1, false
+			return
+		}
+		rf.resetElectionTimeout()
 		if args.PrevLogIndex >= 0 && (len(rf.logs)-1 < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
 			reply.CommitIndex = len(rf.logs) - 1
 			if reply.CommitIndex > args.PrevLogIndex {
@@ -629,8 +636,17 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 				}
 			}
 			reply.Success = false
+			log.Infof("[AppendEntries] Not match prevLogIndex Term: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
+		} else if len(args.Entries) == 0 { //心跳包
+			if rf.lastApplied < args.LeaderCommit { //TODO len(rf.logs)-1 改为 rf.lastApplied+1
+				rf.commitIndex = args.LeaderCommit
+				//go rf.commitLogs() // 可能提交的日志落后与leader 同步一下日志
+			}
+			reply.CommitIndex = len(rf.logs) - 1
+			reply.Success = true
+			log.Infof("[AppendEntries] Heartbeat: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
 		} else { // 成功追加
-			rf.logs = rf.logs[:args.PrevLogIndex+1] // debug: 第一次调用PrevLogIndex为-1
+			rf.logs = rf.logs[:args.PrevLogIndex+1]
 			rf.logs = append(rf.logs, args.Entries...)
 
 			if rf.lastApplied < args.LeaderCommit {
@@ -639,14 +655,25 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 			}
 
 			// 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
-			reply.CommitIndex = len(rf.logs) - 1
+			//reply.CommitIndex = len(rf.logs) - 1
+			//if args.LeaderCommit > rf.commitIndex {
+			//	if args.LeaderCommit < len(rf.logs)-1 {
+			//		reply.CommitIndex = args.LeaderCommit
+			//	}
+			//}
+
+			// append entries rpc 5
 			if args.LeaderCommit > rf.commitIndex {
-				if args.LeaderCommit < len(rf.logs)-1 {
-					reply.CommitIndex = args.LeaderCommit
+				if args.LeaderCommit < rf.logs[len(rf.logs)-1].Index {
+					rf.commitIndex = args.LeaderCommit
+				} else {
+					rf.commitIndex = rf.logs[len(rf.logs)-1].Index
 				}
+				//rf.apply()
 			}
+
 			reply.Success = true
-			rf.votedFor = -1
+			log.Infof("[AppendEntries] Append logs success: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
 		}
 	}
 	return
@@ -665,7 +692,7 @@ func (rf *Raft) commitLogs() { // 2B
 		// listen to messages from Raft indicating newly committed messages.
 		// 调用过程才test_test.go -> start1函数中
 		//TODO 这里为什么加1
-		//rf.applyCh <- ApplyMsg{Index: i + 1, Command: rf.logs[i].Command}
+		rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.logs[i].Command}
 	}
 
 	rf.lastApplied = rf.commitIndex
