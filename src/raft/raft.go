@@ -555,17 +555,23 @@ func (rf *Raft) leaderSendEntryToFollower(serverId int, args *AppendEntryArgs) {
 	if args.Term == rf.currentTerm {
 		// rules for leader 3.1
 		if reply.Success {
-			match := args.PrevLogIndex + len(args.Entries)
-			next := match + 1
-			if rf.nextIndex[serverId] < next {
-				rf.nextIndex[serverId] = next
+			rf.nextIndex[serverId] = reply.CommitIndex + 1 //CommitIndex为对端确定两边相同的index 加上1就是下一个需要发送的日志
+			rf.matchIndex[serverId] = reply.CommitIndex
+			if rf.nextIndex[serverId] > len(rf.logs) {
+				rf.nextIndex[serverId] = rf.logs[len(rf.logs)-1].Index + 1
+				rf.matchIndex[serverId] = rf.nextIndex[serverId] - 1
 			}
-			if rf.matchIndex[serverId] < match {
-				rf.matchIndex[serverId] = match
+		} else {
+			if reply.Term == -1 || reply.Term > rf.currentTerm {
+				return
+			} else if reply.CommitIndex >= 0 {
+				rf.nextIndex[serverId] = reply.CommitIndex + 1
+				if rf.nextIndex[serverId] > len(rf.logs) { //debug
+					rf.nextIndex[serverId] = rf.logs[len(rf.logs)-1].Index + 1
+				}
 			}
-			//rf.nextIndex[serverId] = max(rf.nextIndex[serverId], next)
-			//rf.matchIndex[serverId] = max(rf.matchIndex[serverId], match)
 		}
+		rf.commitLogs()
 	}
 }
 
@@ -574,7 +580,7 @@ func (rf *Raft) appendEntries() {
 	lastLog := rf.logs[len(rf.logs)-1]
 	for peer, _ := range rf.peers {
 		if peer == rf.me {
-			//rf.resetElectionTimeout()
+			rf.resetElectionTimeout()
 			continue
 		}
 		// rules for leader 3
@@ -582,7 +588,7 @@ func (rf *Raft) appendEntries() {
 		if nextIndex <= 0 {
 			nextIndex = 1
 		}
-		if lastLog.Index < nextIndex+1 {
+		if lastLog.Index+1 < nextIndex {
 			nextIndex = lastLog.Index + 1
 		}
 		prevLog := rf.logs[nextIndex-1]
@@ -624,6 +630,7 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		rf.resetElectionTimeout()
 		if args.PrevLogIndex >= 0 && (len(rf.logs)-1 < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+
 			reply.CommitIndex = len(rf.logs) - 1
 			if reply.CommitIndex > args.PrevLogIndex {
 				reply.CommitIndex = args.PrevLogIndex
@@ -642,7 +649,7 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 				rf.commitIndex = args.LeaderCommit
 				//go rf.commitLogs() // 可能提交的日志落后与leader 同步一下日志
 			}
-			reply.CommitIndex = len(rf.logs) - 1
+			reply.CommitIndex = rf.logs[len(rf.logs)-1].Index
 			reply.Success = true
 			log.Infof("[AppendEntries] Heartbeat: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
 		} else { // 成功追加
@@ -654,22 +661,22 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 				//go rf.commitLogs()
 			}
 
-			// 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
-			//reply.CommitIndex = len(rf.logs) - 1
-			//if args.LeaderCommit > rf.commitIndex {
-			//	if args.LeaderCommit < len(rf.logs)-1 {
-			//		reply.CommitIndex = args.LeaderCommit
-			//	}
-			//}
+			reply.CommitIndex = rf.logs[len(rf.logs)-1].Index
+			if args.LeaderCommit > rf.commitIndex {
+				if args.LeaderCommit < len(rf.logs)-1 {
+					reply.CommitIndex = args.LeaderCommit
+				}
+			}
 
 			// append entries rpc 5
+			//如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
 			if args.LeaderCommit > rf.commitIndex {
 				if args.LeaderCommit < rf.logs[len(rf.logs)-1].Index {
 					rf.commitIndex = args.LeaderCommit
 				} else {
 					rf.commitIndex = rf.logs[len(rf.logs)-1].Index
 				}
-				//rf.apply()
+				rf.applyLogs()
 			}
 
 			reply.Success = true
@@ -680,20 +687,43 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 }
 
 // 提交日志
-func (rf *Raft) commitLogs() { // 2B
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) applyLogs() { // 2B
 
 	if rf.commitIndex > len(rf.logs)-1 {
-		log.Fatal("出现错误 : raft.go commitlogs()")
+		log.Infof("[applyLogs] error: commitIndex >  number of logs")
 	}
 
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ { //commit日志到与Leader相同
+	for i := rf.lastApplied + 1; i <= rf.commitIndex && i < len(rf.logs); i++ { //commit日志到与Leader相同
 		// listen to messages from Raft indicating newly committed messages.
 		// 调用过程才test_test.go -> start1函数中
 		//TODO 这里为什么加1
-		rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.logs[i].Command}
+		rf.applyCh <- ApplyMsg{CommandIndex: i, Command: rf.logs[i].Command}
 	}
 
 	rf.lastApplied = rf.commitIndex
+}
+
+func (rf *Raft) commitLogs() {
+	// leader rule 4
+	if rf.state != Leader {
+		return
+	}
+
+	for n := rf.logs[len(rf.logs)-1].Index; n > rf.commitIndex; n-- {
+		//for n := rf.commitIndex + 1; n <= rf.logs[len(rf.logs)-1].Index; n++ {
+		if rf.logs[n].Term < rf.currentTerm {
+			break
+		}
+		counter := 1
+		for serverId := 0; serverId < len(rf.peers); serverId++ {
+			if serverId != rf.me && rf.matchIndex[serverId] >= n {
+				counter++
+			}
+			if counter > len(rf.peers)/2 {
+				rf.commitIndex = n
+				rf.applyLogs()
+				break
+			}
+		}
+	}
 }
