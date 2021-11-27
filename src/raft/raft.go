@@ -152,6 +152,7 @@ func (rf *Raft) setState(state State) {
 }
 
 func (rf *Raft) setNewTerm(newTerm int) {
+	log.Infof("[setNewTerm] change Term: Server: %v  Term %v to Term %v", rf.me, rf.currentTerm, newTerm)
 	rf.currentTerm = newTerm
 }
 
@@ -559,13 +560,15 @@ func (rf *Raft) leaderSendEntryToFollower(serverId int, args *AppendEntryArgs) {
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		rf.setNewTerm(reply.Term)
+		rf.state = Follower
+		rf.resetElectionTimeout()
 		return
 	}
 	if args.Term == rf.currentTerm {
 		// rules for leader 3.1
 		if reply.Success {
 			rf.nextIndex[serverId] = reply.CommitIndex + 1 //CommitIndex为对端确定两边相同的index 加上1就是下一个需要发送的日志
-			rf.matchIndex[serverId] = reply.CommitIndex
+			rf.matchIndex[serverId] = rf.nextIndex[serverId] - 1
 			if rf.nextIndex[serverId] > len(rf.logs) {
 				rf.nextIndex[serverId] = rf.logs[len(rf.logs)-1].Index + 1
 				rf.matchIndex[serverId] = rf.nextIndex[serverId] - 1
@@ -585,7 +588,7 @@ func (rf *Raft) leaderSendEntryToFollower(serverId int, args *AppendEntryArgs) {
 }
 
 func (rf *Raft) appendEntries() {
-	log.Infof("[append log]: Server %v state: %v, currentTerm: %v", rf.me, rf.state, rf.currentTerm)
+	//log.Infof("[append log]: Server %v state: %v, currentTerm: %v, commitIndex: %v, appyIndex: %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied)
 	lastLog := rf.logs[len(rf.logs)-1]
 	for peer, _ := range rf.peers {
 		if peer == rf.me {
@@ -692,7 +695,7 @@ func (rf *Raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 			}
 
 			reply.Success = true
-			log.Infof("[AppendEntries] Append logs success: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, args)
+			log.Infof("[AppendEntries] Append logs success: Server %v state: %v, currentTerm: %v, from server: %v,  args: %+v,", rf.me, rf.state, rf.currentTerm, args.LeaderId, rf.logs)
 		}
 	}
 	return
@@ -720,21 +723,22 @@ func (rf *Raft) commitLogs() {
 	if rf.state != Leader {
 		return
 	}
-
-	for n := rf.logs[len(rf.logs)-1].Index; n > rf.commitIndex; n-- {
-		//for n := rf.commitIndex + 1; n <= rf.logs[len(rf.logs)-1].Index; n++ {
+	//log.Infof("[commitLogs] Server: %v, Term: %v, commitIndex: %v, appyIndex: %v, logs: %+v", rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.logs)
+	//for n := rf.logs[len(rf.logs)-1].Index; n > rf.commitIndex; n-- {
+	for n := rf.commitIndex + 1; n <= rf.logs[len(rf.logs)-1].Index; n++ {
 		if rf.logs[n].Term < rf.currentTerm {
-			break
+			continue
 		}
 		counter := 1
 		for serverId := 0; serverId < len(rf.peers); serverId++ {
+			//log.Infof("Server: %v  nextIndex: %v, match: %v", serverId, rf.nextIndex[serverId], rf.matchIndex[serverId])
 			if serverId != rf.me && rf.matchIndex[serverId] >= n {
 				counter++
 			}
 			if counter > len(rf.peers)/2 {
 				rf.commitIndex = n
 				rf.apply()
-				log.Infof("[commitLogs] Commit logs success: Server %v state: %v, currentTerm: %v, commitIndex: %v, lastAppyIndex: %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied)
+				//log.Infof("[commitLogs] Commit logs success: Server %v state: %v, currentTerm: %v, commitIndex: %v, lastAppyIndex: %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied)
 				break
 			}
 		}
